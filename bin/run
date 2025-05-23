@@ -1,38 +1,42 @@
 #!/bin/sh
 set -e
 
-[ -d /dev/net ] ||
-    mkdir -p /dev/net
-[ -c /dev/net/tun ] ||
-    mknod /dev/net/tun c 10 200
+# Ensure tun device exists
+[ -d /dev/net ] || mkdir -p /dev/net
+[ -c /dev/net/tun ] || mknod /dev/net/tun c 10 200
 
 cd /etc/openvpn
 # This file tells `serveconfig` that there is a config there
 touch placeholder
-[ -f dh.pem ] ||
-    openssl dhparam -out dh.pem 2048
-[ -f key.pem ] ||
-    openssl genrsa -out key.pem 2048
-chmod 600 key.pem
-[ -f csr.pem ] ||
-    openssl req -new -key key.pem -out csr.pem -subj /CN=OpenVPN/
-[ -f cert.pem ] ||
-    openssl x509 -req -in csr.pem -out cert.pem -signkey key.pem -days 24855
 
+# Generate ECDSA key and cert if missing (secp384r1)
+[ -f key.pem ] || openssl ecparam -name secp384r1 -genkey -noout -out key.pem
+chmod 600 key.pem
+[ -f cert.pem ] || openssl req -new -x509 -key key.pem -out cert.pem -days 24855 -subj /CN=OpenVPN/
+
+# IPv6 subnet to use for VPN clients
+VPN_IPV6_SUBNET="2001:db8:0:123::/64"
+
+# IPv4 config: TCP 443
 [ -f tcp443.conf ] || cat >tcp443.conf <<EOF
 server 192.168.255.0 255.255.255.128
-cipher AES-256-CBC
+server-ipv6 $VPN_IPV6_SUBNET
+cipher AES-256-GCM
+ncp-ciphers AES-256-GCM:AES-128-GCM
+ecdh-curve secp384r1
 verb 3
 duplicate-cn
 key key.pem
 ca cert.pem
 cert cert.pem
-dh dh.pem
 keepalive 10 60
 persist-key
 persist-tun
 push "dhcp-option DNS 8.8.8.8"
 push "dhcp-option DNS 8.8.4.4"
+push "route-ipv6 2000::/3"
+push "dhcp-option DNS6 2606:4700:4700::1111"
+push "dhcp-option DNS6 2606:4700:4700::1001"
 
 proto tcp-server
 port 443
@@ -40,20 +44,26 @@ dev tun443
 status openvpn-status-443.log
 EOF
 
+# IPv4 config: UDP 1194
 [ -f udp1194.conf ] || cat >udp1194.conf <<EOF
 server 192.168.255.128 255.255.255.128
-cipher AES-256-CBC
+server-ipv6 $VPN_IPV6_SUBNET
+cipher AES-256-GCM
+ncp-ciphers AES-256-GCM:AES-128-GCM
+ecdh-curve secp384r1
 verb 3
 duplicate-cn
 key key.pem
 ca cert.pem
 cert cert.pem
-dh dh.pem
 keepalive 10 60
 persist-key
 persist-tun
 push "dhcp-option DNS 8.8.8.8"
 push "dhcp-option DNS 8.8.4.4"
+push "route-ipv6 2000::/3"
+push "dhcp-option DNS6 2606:4700:4700::1111"
+push "dhcp-option DNS6 2606:4700:4700::1001"
 
 proto udp
 port 1194
@@ -61,28 +71,32 @@ dev tun1194
 status openvpn-status-1194.log
 EOF
 
+# Get public IPv4 address
 MY_IP_ADDR=$(curl -s http://myip.enix.org/REMOTE_ADDR)
 [ "$MY_IP_ADDR" ] || {
-    echo "Sorry, I could not figure out my public IP address."
-    echo "(I use http://myip.enix.org/REMOTE_ADDR/ for that purpose.)"
+    echo "Could not determine public IPv4 address."
     exit 1
 }
 
+# Generate client config
 [ -f client.ovpn ] || cat >client.ovpn <<EOF
 client
-cipher AES-256-CBC
-nobind
 dev tun
+nobind
+cipher AES-256-GCM
+ncp-ciphers AES-256-GCM:AES-128-GCM
 redirect-gateway def1
+tun-ipv6
+route-ipv6 2000::/3
 
 <key>
-`cat key.pem`
+$(cat key.pem)
 </key>
 <cert>
-`cat cert.pem`
+$(cat cert.pem)
 </cert>
 <ca>
-`cat cert.pem`
+$(cat cert.pem)
 </ca>
 
 <connection>
@@ -94,18 +108,24 @@ remote $MY_IP_ADDR 443 tcp-client
 </connection>
 EOF
 
+# HTTP version of the client config
 [ -f client.http ] || cat >client.http <<EOF
 HTTP/1.0 200 OK
 Content-Type: application/x-openvpn-profile
-Content-Length: `wc -c client.ovpn`
+Content-Length: $(wc -c < client.ovpn)
 
-`cat client.ovpn`
+$(cat client.ovpn)
 EOF
 
+# Enable IP forwarding
+sysctl -w net.ipv4.ip_forward=1
+sysctl -w net.ipv6.conf.all.forwarding=1
+
+# Enable IPv4 NAT
 iptables -t nat -A POSTROUTING -s 192.168.255.0/24 -o eth0 -j MASQUERADE
 
-touch tcp443.log udp1194.log http8080.log
-
+# Logs
+touch tcp443.log udp1194.log
 LOGFILE_TCP=tcp443.log
 LOGFILE_UDP=udp1194.log
 [ -z "$DISABLE_LOGS" ] || {
@@ -113,7 +133,9 @@ LOGFILE_UDP=udp1194.log
     LOGFILE_UDP=/dev/null
 }
 
-while true ; do openvpn tcp443.conf ; done >> "$LOGFILE_TCP" &
-while true ; do openvpn udp1194.conf ; done >> "$LOGFILE_UDP" &
+# Start OpenVPN servers
+while true; do openvpn tcp443.conf; done >> "$LOGFILE_TCP" &
+while true; do openvpn udp1194.conf; done >> "$LOGFILE_UDP" &
 
+# Tail logs
 tail -F *.log
