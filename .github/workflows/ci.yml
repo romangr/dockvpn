@@ -24,7 +24,7 @@ jobs:
       - name: build and deploy branch image to ghcr.io
         if: ${{ github.ref != 'refs/heads/master' }}
         env:
-          GITHUB_PACKAGE_TOKEN: ${{ secrets.PKG_TOKEN }}
+          GITHUB_PACKAGE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DOCKER_HUB_TOKEN: ${{ secrets.DOCKER_HUB_TOKEN }}
           USERNAME: ${{ github.actor }}
           GITHUB_SHA: ${{ github.sha}}
